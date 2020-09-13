@@ -5,8 +5,8 @@ use kurobako_core::problem::{ProblemSpec, ProblemSpecBuilder};
 use randomforest::criterion::Mse;
 use randomforest::table::{ColumnType, TableBuilder};
 use randomforest::{RandomForestRegressor, RandomForestRegressorOptions};
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::BufWriter;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use structopt::StructOpt;
@@ -70,15 +70,23 @@ impl BuildOpt {
             }
         }
 
-        std::fs::create_dir_all(&self.out)?;
         for (i, problem) in problems.values().enumerate() {
-            let path = self.out.join(format!("{}.json", problem.name));
+            let dir = self.out.join(format!("{}/", problem.name));
+            std::fs::create_dir_all(&dir)?;
 
             let model = problem.build_model()?;
-            let file = std::fs::File::create(&path).with_context(|| format!("path={:?}", path))?;
-            serde_json::to_writer(file, &model)?;
 
-            eprintln!("[{}/{}] Created: {:?}", i, problems.len(), path);
+            let spec_path = dir.join("spec.json");
+            let spec_file = std::fs::File::create(&spec_path)
+                .with_context(|| format!("path={:?}", spec_path))?;
+            serde_json::to_writer(spec_file, &model.spec)?;
+
+            let regressor_path = dir.join("model.bin");
+            let regressor_file = std::fs::File::create(&regressor_path)
+                .with_context(|| format!("path={:?}", regressor_path))?;
+            model.regressor.serialize(BufWriter::new(regressor_file))?;
+
+            eprintln!("[{}/{}] Created: {:?}", i, problems.len(), dir);
         }
 
         Ok(())
@@ -187,8 +195,8 @@ impl<'a> Problem<'a> {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 struct Model {
-    pub spec: ProblemSpec,
-    pub regressor: RandomForestRegressor,
+    spec: ProblemSpec,
+    regressor: RandomForestRegressor,
 }
