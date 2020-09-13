@@ -1,0 +1,17 @@
+[package]
+name = "kurobako_surrogate"
+version = "0.1.0"
+authors = ["Takeru Ohta <phjgt308@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1"
+hporecord = "0.0.3"
+kurobako_core = "0.1"
+randomforest = { version = "0.1", features = ["serde"] }
+rlua = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+structopt = "0.3"
