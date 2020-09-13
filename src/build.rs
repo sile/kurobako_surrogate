@@ -1,4 +1,4 @@
-use anyhow::{anyhow, ensure};
+use anyhow::{anyhow, ensure, Context};
 use hporecord::{EvalRecord, ParamRange, Record, Scale, StudyRecord};
 use kurobako_core::domain;
 use kurobako_core::problem::{ProblemSpec, ProblemSpecBuilder};
@@ -7,6 +7,7 @@ use randomforest::table::{ColumnType, TableBuilder};
 use randomforest::{RandomForestRegressor, RandomForestRegressorOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use structopt::StructOpt;
 
@@ -28,6 +29,7 @@ pub struct BuildOpt {
 
 impl BuildOpt {
     pub fn build(&self, records: &[Record]) -> anyhow::Result<()> {
+        let mut problem_names = BTreeMap::new();
         let mut problems = BTreeMap::new();
         for record in records {
             if let Record::Study(study) = record {
@@ -40,8 +42,10 @@ impl BuildOpt {
 
                     lua_ctx.load(&self.problem_name).eval()
                 })?;
-                let problem = Problem::new(name, study, self.objective_index);
-                problems.insert(&study.id, problem);
+                let problem = problems
+                    .entry(name.clone())
+                    .or_insert_with(|| Problem::new(name, study, self.objective_index));
+                problem_names.insert(&study.id, problem.name.clone());
             }
         }
 
@@ -52,23 +56,26 @@ impl BuildOpt {
                     if !eval.state.is_complete() {
                         continue;
                     }
-                    let problem = problems
-                        .get_mut(&eval.study)
+                    let name = problem_names
+                        .get(&eval.study)
                         .ok_or_else(|| anyhow!("unknown study {:?}", eval.study))?;
+                    let problem = problems.get_mut(name).expect("unreachable");
 
-                    problem
-                        .table
-                        .add_row(&eval.params, problem.get_value(eval)?)?;
+                    let v = problem.get_value(eval)?;
+                    if v.is_finite() {
+                        problem.table.add_row(&eval.params, v)?;
+                        problem.samples += 1;
+                    }
                 }
             }
         }
 
+        std::fs::create_dir_all(&self.out)?;
         for (i, problem) in problems.values().enumerate() {
             let path = self.out.join(format!("{}.json", problem.name));
-            std::fs::create_dir_all(&path)?;
 
             let model = problem.build_model()?;
-            let file = std::fs::File::create(&path)?;
+            let file = std::fs::File::create(&path).with_context(|| format!("path={:?}", path))?;
             serde_json::to_writer(file, &model)?;
 
             eprintln!("[{}/{}] Created: {:?}", i, problems.len(), path);
@@ -84,6 +91,7 @@ struct Problem<'a> {
     study: &'a StudyRecord,
     objective_index: usize,
     table: TableBuilder,
+    samples: usize,
 }
 
 impl<'a> Problem<'a> {
@@ -108,6 +116,7 @@ impl<'a> Problem<'a> {
             study,
             objective_index,
             table,
+            samples: 0,
         }
     }
 
@@ -160,14 +169,18 @@ impl<'a> Problem<'a> {
 
         let spec = ProblemSpecBuilder::new(&self.name)
             .params(params)
+            .attr("samples", &self.samples.to_string())
             .value(
                 domain::var(&value_def.name).continuous(value_def.range.min, value_def.range.max),
             )
             .finish()?;
 
         // TODO: CV
+        eprintln!("SAMPLES: {}", self.samples);
         let regressor = RandomForestRegressorOptions::new()
             .parallel()
+            .max_samples(NonZeroUsize::new(1000).expect("unreachable")) // TODO: option
+            .trees(NonZeroUsize::new(1000).expect("unreachable")) // TODO: option
             .fit(Mse, self.table.build()?);
 
         Ok(Model { spec, regressor })

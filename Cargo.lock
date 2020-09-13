@@ -440,8 +440,6 @@ dependencies = [
 [[package]]
 name = "randomforest"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75c5e63d3d4d6e5a009f4f571c14e04e34c6d43d96a220264e0de15bdf06be43"
 dependencies = [
  "ordered-float 2.0.0",
  "rand",
