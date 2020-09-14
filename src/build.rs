@@ -2,11 +2,12 @@ use anyhow::{anyhow, ensure, Context};
 use hporecord::{EvalRecord, ParamRange, Record, Scale, StudyRecord};
 use kurobako_core::domain;
 use kurobako_core::problem::{ProblemSpec, ProblemSpecBuilder};
+use ordered_float::OrderedFloat;
 use randomforest::criterion::Mse;
-use randomforest::table::{ColumnType, TableBuilder};
+use randomforest::table::{ColumnType, Table, TableBuilder};
 use randomforest::{RandomForestRegressor, RandomForestRegressorOptions};
 use std::collections::BTreeMap;
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use structopt::StructOpt;
@@ -25,6 +26,20 @@ pub struct BuildOpt {
     /// Objective value index.
     #[structopt(long, default_value = "0")]
     pub objective_index: usize,
+
+    /// Max samples used for building each tree in a random forest.
+    #[structopt(long, default_value = "1000")]
+    pub max_samples: NonZeroUsize,
+
+    /// Number of trees in a rando forest.
+    #[structopt(long, default_value = "1000")]
+    pub trees: NonZeroUsize,
+
+    #[structopt(long, default_value = "0.1")]
+    pub test_rate: f64,
+
+    #[structopt(long)]
+    pub dump_csv: bool,
 }
 
 impl BuildOpt {
@@ -44,7 +59,7 @@ impl BuildOpt {
                 })?;
                 let problem = problems
                     .entry(name.clone())
-                    .or_insert_with(|| Problem::new(name, study, self.objective_index));
+                    .or_insert_with(|| Problem::new(name, study, self));
                 problem_names.insert(&study.id, problem.name.clone());
             }
         }
@@ -86,7 +101,14 @@ impl BuildOpt {
                 .with_context(|| format!("path={:?}", regressor_path))?;
             model.regressor.serialize(BufWriter::new(regressor_file))?;
 
-            eprintln!("[{}/{}] Created: {:?}", i, problems.len(), dir);
+            eprintln!(
+                "[{}/{}] Created: {:?} (n={}, cc={})",
+                i,
+                problems.len(),
+                dir,
+                model.samples,
+                model.cc
+            );
         }
 
         Ok(())
@@ -97,13 +119,13 @@ impl BuildOpt {
 struct Problem<'a> {
     name: String,
     study: &'a StudyRecord,
-    objective_index: usize,
     table: TableBuilder,
     samples: usize,
+    opt: &'a BuildOpt,
 }
 
 impl<'a> Problem<'a> {
-    fn new(name: String, study: &'a StudyRecord, objective_index: usize) -> Self {
+    fn new(name: String, study: &'a StudyRecord, opt: &'a BuildOpt) -> Self {
         let mut table = TableBuilder::new();
         let column_types = study
             .params
@@ -122,20 +144,20 @@ impl<'a> Problem<'a> {
         Self {
             name,
             study,
-            objective_index,
             table,
             samples: 0,
+            opt,
         }
     }
 
     fn get_value(&self, record: &EvalRecord) -> anyhow::Result<f64> {
         ensure!(
-            self.objective_index < record.values.len(),
+            self.opt.objective_index < record.values.len(),
             "too large objective index"
         );
 
-        let mut v = record.values[self.objective_index];
-        if self.study.values[self.objective_index]
+        let mut v = record.values[self.opt.objective_index];
+        if self.study.values[self.opt.objective_index]
             .direction
             .is_maximize()
         {
@@ -145,7 +167,7 @@ impl<'a> Problem<'a> {
     }
 
     fn build_model(&self) -> anyhow::Result<Model> {
-        let value_def = &self.study.values[self.objective_index];
+        let value_def = &self.study.values[self.opt.objective_index];
         let params = self
             .study
             .params
@@ -175,23 +197,79 @@ impl<'a> Problem<'a> {
             })
             .collect::<Vec<_>>();
 
+        let (train, test) = self
+            .table
+            .build()?
+            .train_test_split(&mut rand::thread_rng(), self.opt.test_rate);
+        let regressor = RandomForestRegressorOptions::new()
+            .parallel()
+            .max_samples(self.opt.max_samples)
+            .trees(self.opt.trees)
+            .fit(Mse, train);
+
+        let cc = self.spearman_rank_correlation_coefficient(&regressor, &test);
+
         let spec = ProblemSpecBuilder::new(&self.name)
             .params(params)
             .attr("samples", &self.samples.to_string())
+            .attr("Spearman's rank correlation coefficient", &cc.to_string())
             .value(
                 domain::var(&value_def.name).continuous(value_def.range.min, value_def.range.max),
             )
             .finish()?;
 
-        // TODO: CV
-        eprintln!("SAMPLES: {}", self.samples);
-        let regressor = RandomForestRegressorOptions::new()
-            .parallel()
-            .max_samples(NonZeroUsize::new(1000).expect("unreachable")) // TODO: option
-            .trees(NonZeroUsize::new(1000).expect("unreachable")) // TODO: option
-            .fit(Mse, self.table.build()?);
+        Ok(Model {
+            spec,
+            regressor,
+            samples: self.samples,
+            cc,
+        })
+    }
 
-        Ok(Model { spec, regressor })
+    fn spearman_rank_correlation_coefficient(
+        &self,
+        regressor: &RandomForestRegressor,
+        test: &Table,
+    ) -> f64 {
+        let mut pairs = test
+            .rows()
+            .map(|row| {
+                let i = row.len() - 1;
+                (0, row[i], regressor.predict(&row[..i]))
+            })
+            .collect::<Vec<_>>();
+
+        if self.opt.dump_csv {
+            let dir = self.opt.out.join(format!("{}/", self.name));
+
+            let csv_path = dir.join("predict.csv");
+            let csv_file = std::fs::File::create(&csv_path)
+                .with_context(|| format!("path={:?}", csv_path))
+                .expect("TODO");
+            let mut csv_file = BufWriter::new(csv_file);
+
+            writeln!(csv_file, "True Value,Predicted Value").expect("TODO");
+            for (_, x, y) in &pairs {
+                writeln!(csv_file, "{},{}", x, y).expect("TODO");
+            }
+        }
+
+        pairs.sort_by_key(|x| OrderedFloat(x.1));
+        for (i, (true_rank, _, _)) in pairs.iter_mut().enumerate() {
+            *true_rank = i;
+        }
+
+        pairs.sort_by_key(|x| OrderedFloat(x.2));
+        let a = pairs
+            .iter()
+            .enumerate()
+            .map(|(expected_rank, (true_rank, _, _))| {
+                (*true_rank as f64 - expected_rank as f64).abs().powi(2)
+            })
+            .sum::<f64>();
+        let n = pairs.len() as f64;
+
+        1.0 - (6.0 * a) / (n.powi(3) - n)
     }
 }
 
@@ -199,4 +277,6 @@ impl<'a> Problem<'a> {
 struct Model {
     spec: ProblemSpec,
     regressor: RandomForestRegressor,
+    samples: usize,
+    cc: f64,
 }

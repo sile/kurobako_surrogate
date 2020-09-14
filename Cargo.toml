@@ -8,8 +8,10 @@ edition = "2018"
 
 [dependencies]
 anyhow = "1"
+ordered-float = "2"
 hporecord = "0.0.3"
 kurobako_core = "0.1"
+rand = "0.7"
 randomforest = "0.1.2"
 rlua = "0.17"
 serde = { version = "1", features = ["derive"] }
