@@ -102,11 +102,12 @@ impl BuildOpt {
             model.regressor.serialize(BufWriter::new(regressor_file))?;
 
             eprintln!(
-                "[{}/{}] Created: {:?} (n={}, cc={})",
+                "[{}/{}] Created: {:?} (n={}, outliers={}, cc={})",
                 i,
                 problems.len(),
                 dir,
                 model.samples,
+                model.outliers,
                 model.cc
             );
         }
@@ -197,10 +198,13 @@ impl<'a> Problem<'a> {
             })
             .collect::<Vec<_>>();
 
-        let (train, test) = self
-            .table
-            .build()?
-            .train_test_split(&mut rand::thread_rng(), self.opt.test_rate);
+        let table = self.table.build()?;
+        let (mut train, test) = table.train_test_split(&mut rand::thread_rng(), self.opt.test_rate);
+
+        // TODO: Make the threshold to an option.
+        let p95 = percentile(train.rows().map(|row| row[row.len() - 1]), 0.95);
+        let outliers = train.filter(|row| row[row.len() - 1] <= p95);
+
         let regressor = RandomForestRegressorOptions::new()
             .parallel()
             .max_samples(self.opt.max_samples)
@@ -212,6 +216,7 @@ impl<'a> Problem<'a> {
         let spec = ProblemSpecBuilder::new(&self.name)
             .params(params)
             .attr("samples", &self.samples.to_string())
+            .attr("outliers", &outliers.to_string())
             .attr("Spearman's rank correlation coefficient", &cc.to_string())
             .value(
                 domain::var(&value_def.name).continuous(value_def.range.min, value_def.range.max),
@@ -222,6 +227,7 @@ impl<'a> Problem<'a> {
             spec,
             regressor,
             samples: self.samples,
+            outliers,
             cc,
         })
     }
@@ -278,5 +284,12 @@ struct Model {
     spec: ProblemSpec,
     regressor: RandomForestRegressor,
     samples: usize,
+    outliers: usize,
     cc: f64,
+}
+
+fn percentile(xs: impl Iterator<Item = f64>, p: f64) -> f64 {
+    let mut xs = xs.collect::<Vec<_>>();
+    xs.sort_by_key(|x| OrderedFloat(*x));
+    xs[(xs.len() as f64 * p) as usize]
 }
