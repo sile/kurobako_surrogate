@@ -3,8 +3,9 @@ use hporecord::{EvalRecord, ParamRange, Record, Scale, StudyRecord};
 use kurobako_core::domain;
 use kurobako_core::problem::{ProblemSpec, ProblemSpecBuilder};
 use ordered_float::OrderedFloat;
+use rand::seq::SliceRandom;
 use randomforest::criterion::Mse;
-use randomforest::table::{ColumnType, Table, TableBuilder};
+use randomforest::table::{ColumnType, TableBuilder};
 use randomforest::{RandomForestRegressor, RandomForestRegressorOptions};
 use std::collections::BTreeMap;
 use std::io::{BufWriter, Write};
@@ -78,18 +79,20 @@ impl BuildOpt {
 
                     let v = problem.get_value(eval)?;
                     if v.is_finite() {
-                        problem.table.add_row(&eval.params, v)?;
+                        problem.rows.push((eval.params.clone(), v));
                         problem.samples += 1;
                     }
                 }
             }
         }
 
-        for (i, problem) in problems.values().enumerate() {
+        let problems_len = problems.len();
+        for (i, problem) in problems.values_mut().enumerate() {
             let dir = self.out.join(format!("{}/", problem.name));
             std::fs::create_dir_all(&dir)?;
 
-            let model = problem.build_model()?;
+            let rows = std::mem::take(&mut problem.rows);
+            let model = problem.build_model(rows)?;
 
             let spec_path = dir.join("spec.json");
             let spec_file = std::fs::File::create(&spec_path)
@@ -103,12 +106,7 @@ impl BuildOpt {
 
             eprintln!(
                 "[{}/{}] Created: {:?} (n={}, outliers={}, cc={})",
-                i,
-                problems.len(),
-                dir,
-                model.samples,
-                model.outliers,
-                model.cc
+                i, problems_len, dir, model.samples, model.outliers, model.cc
             );
         }
 
@@ -121,6 +119,7 @@ struct Problem<'a> {
     name: String,
     study: &'a StudyRecord,
     table: TableBuilder,
+    rows: Vec<(Vec<f64>, f64)>,
     samples: usize,
     opt: &'a BuildOpt,
 }
@@ -147,6 +146,7 @@ impl<'a> Problem<'a> {
             study,
             table,
             samples: 0,
+            rows: Vec::new(),
             opt,
         }
     }
@@ -167,7 +167,7 @@ impl<'a> Problem<'a> {
         Ok(v)
     }
 
-    fn build_model(&self) -> anyhow::Result<Model> {
+    fn build_model(&mut self, mut rows: Vec<(Vec<f64>, f64)>) -> anyhow::Result<Model> {
         let value_def = &self.study.values[self.opt.objective_index];
         let params = self
             .study
@@ -198,20 +198,33 @@ impl<'a> Problem<'a> {
             })
             .collect::<Vec<_>>();
 
-        let table = self.table.build()?;
-        let (mut train, test) = table.train_test_split(&mut rand::thread_rng(), self.opt.test_rate);
+        let rows_len = rows.len();
+        rows.shuffle(&mut rand::thread_rng());
+        let (test_rows, train_rows) =
+            rows.split_at_mut((rows_len as f64 * self.opt.test_rate) as usize);
 
-        // TODO: Make the threshold to an option.
-        let p95 = percentile(train.rows().map(|row| row[row.len() - 1]), 0.95);
-        let outliers = train.filter(|row| row[row.len() - 1] <= p95);
+        let mut outliers = 0;
+        let p95 = percentile(train_rows.iter().map(|x| x.1), 0.95);
+        for r in train_rows.iter_mut() {
+            if r.1 > p95 {
+                r.1 = p95;
+                outliers += 1;
+            }
+        }
+
+        for r in train_rows {
+            self.table.add_row(&r.0, r.1)?;
+        }
+
+        let table = self.table.build()?;
 
         let regressor = RandomForestRegressorOptions::new()
             .parallel()
             .max_samples(self.opt.max_samples)
             .trees(self.opt.trees)
-            .fit(Mse, train);
+            .fit(Mse, table);
 
-        let cc = self.spearman_rank_correlation_coefficient(&regressor, &test);
+        let cc = self.spearman_rank_correlation_coefficient(&regressor, &test_rows);
 
         let spec = ProblemSpecBuilder::new(&self.name)
             .params(params)
@@ -235,14 +248,11 @@ impl<'a> Problem<'a> {
     fn spearman_rank_correlation_coefficient(
         &self,
         regressor: &RandomForestRegressor,
-        test: &Table,
+        test_rows: &[(Vec<f64>, f64)],
     ) -> f64 {
-        let mut pairs = test
-            .rows()
-            .map(|row| {
-                let i = row.len() - 1;
-                (0, row[i], regressor.predict(&row[..i]))
-            })
+        let mut pairs = test_rows
+            .iter()
+            .map(|row| (0, row.1, regressor.predict(&row.0)))
             .collect::<Vec<_>>();
 
         if self.opt.dump_csv {
